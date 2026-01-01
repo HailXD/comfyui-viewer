@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import sys
+import zlib
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -97,6 +98,8 @@ IMAGE_EXTS = {
     ".tiff",
     ".avif",
 }
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def is_image_file(name):
@@ -244,9 +247,7 @@ def find_json_candidate(text, start_index):
     return None
 
 
-def extract_json_from_bytes(data, max_scan=5 * 1024 * 1024):
-    view = data[:max_scan]
-    text = view.decode("utf-8", errors="ignore")
+def extract_json_from_text(text):
     search_index = 0
     while True:
         start = text.find("{", search_index)
@@ -261,6 +262,82 @@ def extract_json_from_bytes(data, max_scan=5 * 1024 * 1024):
             return json.dumps(parsed, indent=2, ensure_ascii=False)
         except json.JSONDecodeError:
             search_index = start + 1
+
+
+def extract_json_from_bytes(data, max_scan=5 * 1024 * 1024):
+    view = data[:max_scan]
+    text = view.decode("utf-8", errors="ignore")
+    return extract_json_from_text(text)
+
+
+def extract_text_from_png_chunk(chunk_type, data):
+    try:
+        if chunk_type == b"tEXt":
+            _, text = data.split(b"\x00", 1)
+            return text.decode("latin-1", errors="ignore")
+        if chunk_type == b"zTXt":
+            _, rest = data.split(b"\x00", 1)
+            if not rest:
+                return None
+            if rest[0] != 0:
+                return None
+            try:
+                text = zlib.decompress(rest[1:])
+            except zlib.error:
+                return None
+            return text.decode("latin-1", errors="ignore")
+        if chunk_type == b"iTXt":
+            _, rest = data.split(b"\x00", 1)
+            if len(rest) < 2:
+                return None
+            compressed = rest[0]
+            if compressed not in (0, 1):
+                return None
+            if rest[1] != 0 and compressed == 1:
+                return None
+            rest = rest[2:]
+            parts = rest.split(b"\x00", 2)
+            if len(parts) != 3:
+                return None
+            _, _, text = parts
+            if compressed == 1:
+                try:
+                    text = zlib.decompress(text)
+                except zlib.error:
+                    return None
+            return text.decode("utf-8", errors="ignore")
+    except ValueError:
+        return None
+    return None
+
+
+def extract_json_from_png(path):
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(8) != PNG_SIGNATURE:
+                return None
+            while True:
+                header = handle.read(8)
+                if len(header) < 8:
+                    return None
+                length = int.from_bytes(header[:4], "big")
+                chunk_type = header[4:8]
+                if length < 0:
+                    return None
+                if chunk_type in (b"tEXt", b"zTXt", b"iTXt"):
+                    data = handle.read(length)
+                    handle.read(4)
+                    text = extract_text_from_png_chunk(chunk_type, data)
+                    if text:
+                        json_text = extract_json_from_text(text)
+                        if json_text:
+                            return json_text
+                else:
+                    handle.seek(length + 4, os.SEEK_CUR)
+                if chunk_type == b"IEND":
+                    return None
+    except OSError:
+        return None
 
 
 class ImageView(QtWidgets.QGraphicsView):
@@ -387,9 +464,13 @@ class ImageDialog(QtWidgets.QDialog):
             self.meta_view.setPlainText("Unable to load metadata for this file.")
             return
         try:
-            with open(self.path, "rb") as handle:
-                data = handle.read(5 * 1024 * 1024)
-            json_text = extract_json_from_bytes(data)
+            ext = os.path.splitext(self.path)[1].lower()
+            if ext == ".png":
+                json_text = extract_json_from_png(self.path)
+            else:
+                with open(self.path, "rb") as handle:
+                    data = handle.read(5 * 1024 * 1024)
+                json_text = extract_json_from_bytes(data)
             if json_text:
                 self.meta_view.setPlainText(json_text)
             else:
