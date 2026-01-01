@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -57,6 +58,30 @@ def qt_mouse_left():
 def qt_focus_strong():
     return (
         QtCore.Qt.FocusPolicy.StrongFocus if QT6 else QtCore.Qt.StrongFocus
+    )
+
+
+def qt_graphics_drag_hand():
+    return (
+        QtWidgets.QGraphicsView.DragMode.ScrollHandDrag
+        if QT6
+        else QtWidgets.QGraphicsView.ScrollHandDrag
+    )
+
+
+def qt_anchor_under_mouse():
+    return (
+        QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse
+        if QT6
+        else QtWidgets.QGraphicsView.AnchorUnderMouse
+    )
+
+
+def qt_painter_smooth():
+    return (
+        QtGui.QPainter.RenderHint.SmoothPixmapTransform
+        if QT6
+        else QtGui.QPainter.SmoothPixmapTransform
     )
 
 
@@ -129,18 +154,89 @@ def find_file_for_number(base_dir, date, number):
     return None
 
 
-def format_bytes(data, max_bytes=1000):
-    view = data[:max_bytes]
-    lines = []
-    for offset in range(0, len(view), 16):
-        chunk = view[offset : offset + 16]
-        hex_part = " ".join(f"{byte:02x}" for byte in chunk)
-        ascii_part = "".join(
-            chr(byte) if 32 <= byte <= 126 else "." for byte in chunk
-        )
-        padded_hex = hex_part.ljust(16 * 3 - 1, " ")
-        lines.append(f"{offset:04x}  {padded_hex}  |{ascii_part}|")
-    return "\n".join(lines)
+def find_json_candidate(text, start_index):
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start_index, len(text)):
+        char = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start_index : idx + 1]
+    return None
+
+
+def extract_json_from_bytes(data, max_scan=5 * 1024 * 1024):
+    view = data[:max_scan]
+    text = view.decode("utf-8", errors="ignore")
+    search_index = 0
+    while True:
+        start = text.find("{", search_index)
+        if start == -1:
+            return None
+        candidate = find_json_candidate(text, start)
+        if not candidate:
+            search_index = start + 1
+            continue
+        try:
+            parsed = json.loads(candidate)
+            return json.dumps(parsed, indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            search_index = start + 1
+
+
+class ImageView(QtWidgets.QGraphicsView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._zoom = 1.0
+        scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(scene)
+        self._pixmap_item = QtWidgets.QGraphicsPixmapItem()
+        scene.addItem(self._pixmap_item)
+        self.setBackgroundBrush(QtGui.QColor(18, 18, 18))
+        self.setRenderHint(qt_painter_smooth())
+        self.setDragMode(qt_graphics_drag_hand())
+        self.setTransformationAnchor(qt_anchor_under_mouse())
+        self.setResizeAnchor(qt_anchor_under_mouse())
+
+    def set_pixmap(self, pixmap):
+        self._pixmap_item.setPixmap(pixmap)
+        self.scene().setSceneRect(QtCore.QRectF(pixmap.rect()))
+        self.set_zoom(1.0)
+
+    def set_zoom(self, value):
+        self._zoom = max(0.2, min(8.0, value))
+        self.resetTransform()
+        self.scale(self._zoom, self._zoom)
+
+    def adjust_zoom(self, delta):
+        self.set_zoom(self._zoom + delta)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        factor = 1.25 if delta > 0 else 0.8
+        new_zoom = self._zoom * factor
+        if 0.2 <= new_zoom <= 8.0:
+            self._zoom = new_zoom
+            self.scale(factor, factor)
+        event.accept()
 
 
 class ImageDialog(QtWidgets.QDialog):
@@ -149,7 +245,6 @@ class ImageDialog(QtWidgets.QDialog):
         self.setWindowTitle("Preview")
         self.resize(1000, 700)
         self.path = path
-        self.zoom = 1.0
         self.original_pixmap = QtGui.QPixmap(path) if path else QtGui.QPixmap()
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -175,69 +270,66 @@ class ImageDialog(QtWidgets.QDialog):
         body = QtWidgets.QHBoxLayout()
         layout.addLayout(body, 1)
 
-        self.image_label = QtWidgets.QLabel()
-        self.image_label.setAlignment(qt_align_center())
-        self.image_label.setStyleSheet("background: #111; color: #eee;")
+        self.image_view = ImageView()
+        self.image_view.setMinimumHeight(320)
+        body.addWidget(self.image_view, 3)
 
-        image_container = QtWidgets.QScrollArea()
-        image_container.setWidgetResizable(True)
-        image_container.setWidget(self.image_label)
+        meta_container = QtWidgets.QWidget()
+        meta_layout = QtWidgets.QVBoxLayout(meta_container)
+        meta_layout.setContentsMargins(0, 0, 0, 0)
+        meta_layout.setSpacing(6)
 
-        body.addWidget(image_container, 3)
+        meta_label = QtWidgets.QLabel("Metadata JSON")
+        meta_label.setStyleSheet("font-weight: 600; color: #333;")
+        meta_layout.addWidget(meta_label)
 
-        self.bytes_view = QtWidgets.QTextEdit()
-        self.bytes_view.setReadOnly(True)
-        self.bytes_view.setFontFamily("Consolas")
-        self.bytes_view.setStyleSheet("background: #101010; color: #f0f0f0;")
-        self.bytes_view.setMinimumWidth(320)
-        body.addWidget(self.bytes_view, 2)
+        self.meta_view = QtWidgets.QTextEdit()
+        self.meta_view.setReadOnly(True)
+        self.meta_view.setFontFamily("Consolas")
+        self.meta_view.setStyleSheet("background: #101010; color: #f0f0f0;")
+        self.meta_view.setMinimumWidth(320)
+        self.meta_view.setPlainText("Loading metadata...")
+        meta_layout.addWidget(self.meta_view, 1)
+
+        body.addWidget(meta_container, 2)
 
         footer = QtWidgets.QHBoxLayout()
         layout.addLayout(footer)
         footer.addStretch()
 
         zoom_out = QtWidgets.QPushButton("-")
-        zoom_out.clicked.connect(lambda: self.adjust_zoom(-0.2))
+        zoom_out.clicked.connect(lambda: self.image_view.adjust_zoom(-0.2))
         zoom_reset = QtWidgets.QPushButton("Reset")
-        zoom_reset.clicked.connect(lambda: self.set_zoom(1.0))
+        zoom_reset.clicked.connect(lambda: self.image_view.set_zoom(1.0))
         zoom_in = QtWidgets.QPushButton("+")
-        zoom_in.clicked.connect(lambda: self.adjust_zoom(0.2))
+        zoom_in.clicked.connect(lambda: self.image_view.adjust_zoom(0.2))
         footer.addWidget(zoom_out)
         footer.addWidget(zoom_reset)
         footer.addWidget(zoom_in)
 
         self.load_preview()
-        self.load_bytes()
+        self.load_metadata()
 
     def load_preview(self):
         if self.original_pixmap.isNull():
-            self.image_label.setText("Preview unavailable.")
+            self.image_view.set_pixmap(QtGui.QPixmap())
             return
-        self.set_zoom(1.0)
+        self.image_view.set_pixmap(self.original_pixmap)
 
-    def set_zoom(self, value):
-        self.zoom = max(0.2, min(5.0, value))
-        if self.original_pixmap.isNull():
-            return
-        width = max(1, int(self.original_pixmap.width() * self.zoom))
-        height = max(1, int(self.original_pixmap.height() * self.zoom))
-        scaled = self.original_pixmap.scaled(width, height, qt_keep_aspect(), qt_smooth())
-        self.image_label.setPixmap(scaled)
-        self.image_label.resize(scaled.size())
-
-    def adjust_zoom(self, delta):
-        self.set_zoom(self.zoom + delta)
-
-    def load_bytes(self):
+    def load_metadata(self):
         if not self.path or not os.path.exists(self.path):
-            self.bytes_view.setPlainText("Unable to load bytes for this file.")
+            self.meta_view.setPlainText("Unable to load metadata for this file.")
             return
         try:
             with open(self.path, "rb") as handle:
-                data = handle.read(1000)
-            self.bytes_view.setPlainText(format_bytes(data))
+                data = handle.read(5 * 1024 * 1024)
+            json_text = extract_json_from_bytes(data)
+            if json_text:
+                self.meta_view.setPlainText(json_text)
+            else:
+                self.meta_view.setPlainText("No JSON metadata found.")
         except OSError:
-            self.bytes_view.setPlainText("Unable to load bytes for this file.")
+            self.meta_view.setPlainText("Unable to load metadata for this file.")
 
 
 class ImageCard(QtWidgets.QFrame):
