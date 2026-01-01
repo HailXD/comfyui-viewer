@@ -153,6 +153,17 @@ def open_cache(base_dir):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata_cache (
+            path TEXT PRIMARY KEY,
+            metadata_json TEXT,
+            ckpt_name TEXT,
+            sampler_name1 TEXT,
+            sampler_name2 TEXT
+        )
+        """
+    )
     return conn
 
 
@@ -183,6 +194,38 @@ def get_cached_path(conn, date, number):
     return None
 
 
+def get_cached_metadata(conn, path):
+    if conn is None or not path:
+        return None
+    if not os.path.exists(path):
+        try:
+            conn.execute("DELETE FROM metadata_cache WHERE path = ?", (path,))
+            conn.commit()
+        except sqlite3.Error:
+            return None
+        return None
+    try:
+        row = conn.execute(
+            """
+            SELECT metadata_json, ckpt_name, sampler_name1, sampler_name2
+            FROM metadata_cache
+            WHERE path = ?
+            """,
+            (path,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    metadata_json, ckpt_name, sampler1, sampler2 = row
+    samplers = [value for value in (sampler1, sampler2) if value]
+    return {
+        "metadata_json": metadata_json,
+        "ckpt_name": ckpt_name,
+        "samplers": samplers,
+    }
+
+
 def update_cache(conn, date, number, path):
     if conn is None or not path:
         return
@@ -190,6 +233,25 @@ def update_cache(conn, date, number, path):
         conn.execute(
             "INSERT OR REPLACE INTO file_cache (date, number, path) VALUES (?, ?, ?)",
             (date, number, path),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        return
+
+
+def update_metadata_cache(conn, path, metadata_json, ckpt_name, sampler_names):
+    if conn is None or not path:
+        return
+    sampler1 = sampler_names[0] if len(sampler_names) > 0 else None
+    sampler2 = sampler_names[1] if len(sampler_names) > 1 else None
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO metadata_cache
+            (path, metadata_json, ckpt_name, sampler_name1, sampler_name2)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (path, metadata_json, ckpt_name, sampler1, sampler2),
         )
         conn.commit()
     except sqlite3.Error:
@@ -268,6 +330,36 @@ def extract_json_from_bytes(data, max_scan=5 * 1024 * 1024):
     view = data[:max_scan]
     text = view.decode("utf-8", errors="ignore")
     return extract_json_from_text(text)
+
+
+def _collect_values(obj, key, max_count, results):
+    if len(results) >= max_count:
+        return
+    if isinstance(obj, dict):
+        for obj_key, value in obj.items():
+            if obj_key == key and not isinstance(value, (dict, list)):
+                results.append(str(value))
+                if len(results) >= max_count:
+                    return
+            _collect_values(value, key, max_count, results)
+    elif isinstance(obj, list):
+        for value in obj:
+            _collect_values(value, key, max_count, results)
+
+
+def extract_metadata_fields(json_text):
+    if not json_text:
+        return None, []
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        return None, []
+    ckpt_values = []
+    sampler_values = []
+    _collect_values(parsed, "ckpt_name", 1, ckpt_values)
+    _collect_values(parsed, "sampler_name", 2, sampler_values)
+    ckpt_name = ckpt_values[0] if ckpt_values else None
+    return ckpt_name, sampler_values
 
 
 def extract_text_from_png_chunk(chunk_type, data):
@@ -381,11 +473,12 @@ class ImageView(QtWidgets.QGraphicsView):
 
 
 class ImageDialog(QtWidgets.QDialog):
-    def __init__(self, path, title, parent=None):
+    def __init__(self, path, title, cache_conn=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Preview")
         self.resize(1000, 700)
         self.path = path
+        self.cache_conn = cache_conn
         self.original_pixmap = QtGui.QPixmap(path) if path else QtGui.QPixmap()
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -420,9 +513,19 @@ class ImageDialog(QtWidgets.QDialog):
         meta_layout.setContentsMargins(0, 0, 0, 0)
         meta_layout.setSpacing(6)
 
-        meta_label = QtWidgets.QLabel("Metadata JSON")
+        meta_label = QtWidgets.QLabel("Metadata")
         meta_label.setStyleSheet("font-weight: 600; color: #cfcfcf;")
         meta_layout.addWidget(meta_label)
+
+        self.ckpt_label = QtWidgets.QLabel("ckpt_name: -")
+        self.ckpt_label.setStyleSheet("color: #9aa0a6;")
+        self.ckpt_label.setWordWrap(True)
+        meta_layout.addWidget(self.ckpt_label)
+
+        self.sampler_label = QtWidgets.QLabel("sampler_name: -")
+        self.sampler_label.setStyleSheet("color: #9aa0a6;")
+        self.sampler_label.setWordWrap(True)
+        meta_layout.addWidget(self.sampler_label)
 
         self.meta_view = QtWidgets.QTextEdit()
         self.meta_view.setReadOnly(True)
@@ -461,30 +564,63 @@ class ImageDialog(QtWidgets.QDialog):
 
     def load_metadata(self):
         if not self.path or not os.path.exists(self.path):
+            self.ckpt_label.setText("ckpt_name: -")
+            self.sampler_label.setText("sampler_name: -")
             self.meta_view.setPlainText("Unable to load metadata for this file.")
             return
         try:
             ext = os.path.splitext(self.path)[1].lower()
-            if ext == ".png":
-                json_text = extract_json_from_png(self.path)
+            cached = get_cached_metadata(self.cache_conn, self.path)
+            if cached is not None:
+                json_text = cached["metadata_json"]
+                ckpt_name = cached["ckpt_name"]
+                sampler_names = cached["samplers"]
+                if json_text and (ckpt_name is None and not sampler_names):
+                    ckpt_name, sampler_names = extract_metadata_fields(json_text)
+                    update_metadata_cache(
+                        self.cache_conn,
+                        self.path,
+                        json_text,
+                        ckpt_name,
+                        sampler_names,
+                    )
             else:
-                with open(self.path, "rb") as handle:
-                    data = handle.read(5 * 1024 * 1024)
-                json_text = extract_json_from_bytes(data)
+                if ext == ".png":
+                    json_text = extract_json_from_png(self.path)
+                else:
+                    with open(self.path, "rb") as handle:
+                        data = handle.read(5 * 1024 * 1024)
+                    json_text = extract_json_from_bytes(data)
+                ckpt_name, sampler_names = extract_metadata_fields(json_text)
+                cached_json = json_text if json_text is not None else ""
+                update_metadata_cache(
+                    self.cache_conn,
+                    self.path,
+                    cached_json,
+                    ckpt_name,
+                    sampler_names,
+                )
+            ckpt_display = ckpt_name or "-"
+            sampler_display = ", ".join(sampler_names) if sampler_names else "-"
+            self.ckpt_label.setText(f"ckpt_name: {ckpt_display}")
+            self.sampler_label.setText(f"sampler_name: {sampler_display}")
             if json_text:
                 self.meta_view.setPlainText(json_text)
             else:
                 self.meta_view.setPlainText("No JSON metadata found.")
         except OSError:
+            self.ckpt_label.setText("ckpt_name: -")
+            self.sampler_label.setText("sampler_name: -")
             self.meta_view.setPlainText("Unable to load metadata for this file.")
 
 
 class ImageCard(QtWidgets.QFrame):
-    def __init__(self, date, number, path, parent=None):
+    def __init__(self, date, number, path, cache_conn=None, parent=None):
         super().__init__(parent)
         self.date = date
         self.number = number
         self.path = path
+        self.cache_conn = cache_conn
         self.setFrameShape(qt_frame_styled_panel())
         self.setStyleSheet(
             "QFrame { background: #1c1e22; border: 1px solid #2c2f36; border-radius: 10px; }"
@@ -535,7 +671,10 @@ class ImageCard(QtWidgets.QFrame):
     def mousePressEvent(self, event):
         if event.button() == qt_mouse_left() and self.path:
             dialog = ImageDialog(
-                self.path, f"{self.date} / {self.number}", parent=self
+                self.path,
+                f"{self.date} / {self.number}",
+                cache_conn=self.cache_conn,
+                parent=self,
             )
             dialog.exec()
         super().mousePressEvent(event)
@@ -640,7 +779,7 @@ class FavoritesViewer(QtWidgets.QMainWindow):
                 path = find_file_for_number(
                     self.base_dir, date, number, self.cache_conn
                 )
-                card = ImageCard(date, number, path)
+                card = ImageCard(date, number, path, cache_conn=self.cache_conn)
                 row = index // columns
                 col = index % columns
                 grid.addWidget(card, row, col)
