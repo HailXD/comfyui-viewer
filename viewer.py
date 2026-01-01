@@ -259,7 +259,7 @@ class ImageDialog(QtWidgets.QDialog):
         title_label.setStyleSheet("font-weight: 600; font-size: 16px;")
         self.path_label = QtWidgets.QLabel(path or "")
         self.path_label.setWordWrap(True)
-        self.path_label.setStyleSheet("color: #555;")
+        self.path_label.setStyleSheet("color: #9aa0a6;")
         text_wrap.addWidget(title_label)
         text_wrap.addWidget(self.path_label)
 
@@ -280,13 +280,15 @@ class ImageDialog(QtWidgets.QDialog):
         meta_layout.setSpacing(6)
 
         meta_label = QtWidgets.QLabel("Metadata JSON")
-        meta_label.setStyleSheet("font-weight: 600; color: #333;")
+        meta_label.setStyleSheet("font-weight: 600; color: #cfcfcf;")
         meta_layout.addWidget(meta_label)
 
         self.meta_view = QtWidgets.QTextEdit()
         self.meta_view.setReadOnly(True)
         self.meta_view.setFontFamily("Consolas")
-        self.meta_view.setStyleSheet("background: #101010; color: #f0f0f0;")
+        self.meta_view.setStyleSheet(
+            "background: #101114; color: #f0f0f0; border: 1px solid #2b2e35;"
+        )
         self.meta_view.setMinimumWidth(320)
         self.meta_view.setPlainText("Loading metadata...")
         meta_layout.addWidget(self.meta_view, 1)
@@ -340,7 +342,7 @@ class ImageCard(QtWidgets.QFrame):
         self.path = path
         self.setFrameShape(qt_frame_styled_panel())
         self.setStyleSheet(
-            "QFrame { background: #faf7f2; border: 1px solid #ddd; border-radius: 10px; }"
+            "QFrame { background: #1c1e22; border: 1px solid #2c2f36; border-radius: 10px; }"
         )
         self.setCursor(QtGui.QCursor(qt_cursor_pointing()))
 
@@ -350,7 +352,7 @@ class ImageCard(QtWidgets.QFrame):
 
         self.thumb = QtWidgets.QLabel("Searching for matching file...")
         self.thumb.setAlignment(qt_align_center())
-        self.thumb.setStyleSheet("background: #efe9de; color: #666;")
+        self.thumb.setStyleSheet("background: #25282e; color: #9aa0a6;")
         self.thumb.setFixedHeight(160)
         layout.addWidget(self.thumb)
 
@@ -359,7 +361,7 @@ class ImageCard(QtWidgets.QFrame):
         layout.addWidget(num_label)
 
         self.file_label = QtWidgets.QLabel("Scanning folder...")
-        self.file_label.setStyleSheet("color: #666;")
+        self.file_label.setStyleSheet("color: #9aa0a6;")
         self.file_label.setWordWrap(True)
         layout.addWidget(self.file_label)
 
@@ -421,7 +423,7 @@ class FavoritesViewer(QtWidgets.QMainWindow):
         header.addWidget(reload_btn)
 
         self.status = QtWidgets.QLabel("Ready.")
-        self.status.setStyleSheet("color: #555;")
+        self.status.setStyleSheet("color: #9aa0a6;")
         outer.addWidget(self.status)
 
         self.scroll = QtWidgets.QScrollArea()
@@ -463,7 +465,7 @@ class FavoritesViewer(QtWidgets.QMainWindow):
 
             container = QtWidgets.QFrame()
             container.setStyleSheet(
-                "QFrame { background: #ffffff; border: 1px solid #e1ddd6; border-radius: 12px; }"
+                "QFrame { background: #191b1f; border: 1px solid #2a2d33; border-radius: 12px; }"
             )
             container_layout = QtWidgets.QVBoxLayout(container)
             container_layout.setContentsMargins(14, 14, 14, 14)
@@ -472,7 +474,7 @@ class FavoritesViewer(QtWidgets.QMainWindow):
             date_label = QtWidgets.QLabel(date)
             date_label.setStyleSheet("font-weight: 600; font-size: 16px;")
             count_label = QtWidgets.QLabel(f"{len(numbers)} favorites")
-            count_label.setStyleSheet("color: #666;")
+            count_label.setStyleSheet("color: #9aa0a6;")
             header.addWidget(date_label)
             header.addStretch()
             header.addWidget(count_label)
@@ -497,6 +499,39 @@ class FavoritesViewer(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(
+        """
+        QMainWindow, QWidget {
+            background-color: #141417;
+            color: #e6e6e6;
+        }
+        QLabel {
+            color: #e6e6e6;
+        }
+        QScrollArea {
+            background-color: transparent;
+        }
+        QScrollArea > QWidget > QWidget {
+            background-color: transparent;
+        }
+        QPushButton {
+            background-color: #2a2d33;
+            color: #e6e6e6;
+            border: 1px solid #3a3d44;
+            border-radius: 6px;
+            padding: 6px 12px;
+        }
+        QPushButton:hover {
+            background-color: #343842;
+        }
+        QTextEdit {
+            background-color: #101114;
+            color: #e6e6e6;
+            border: 1px solid #2b2e35;
+            border-radius: 6px;
+        }
+        """
+    )
     base_dir = os.path.abspath(os.path.dirname(__file__))
     viewer = FavoritesViewer(base_dir)
     viewer.show()
