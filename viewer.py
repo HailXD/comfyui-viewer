@@ -8,6 +8,9 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 QT6 = True
 
+ZOOM_MIN = 0.05
+ZOOM_MAX = 8.0
+
 
 def qt_align_center():
     return QtCore.Qt.AlignmentFlag.AlignCenter if QT6 else QtCore.Qt.AlignCenter
@@ -141,7 +144,9 @@ def parse_fav_yaml(path):
 
 
 def open_cache(base_dir):
-    path = os.path.join(base_dir, "cache.sqlite")
+    cache_dir = os.path.join(base_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "db.sqlite")
     conn = sqlite3.connect(path)
     conn.execute(
         """
@@ -149,18 +154,11 @@ def open_cache(base_dir):
             date TEXT NOT NULL,
             number TEXT NOT NULL,
             path TEXT NOT NULL,
-            PRIMARY KEY (date, number)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS metadata_cache (
-            path TEXT PRIMARY KEY,
             metadata_json TEXT,
             ckpt_name TEXT,
             sampler_name1 TEXT,
-            sampler_name2 TEXT
+            sampler_name2 TEXT,
+            PRIMARY KEY (date, number)
         )
         """
     )
@@ -199,7 +197,7 @@ def get_cached_metadata(conn, path):
         return None
     if not os.path.exists(path):
         try:
-            conn.execute("DELETE FROM metadata_cache WHERE path = ?", (path,))
+            conn.execute("DELETE FROM file_cache WHERE path = ?", (path,))
             conn.commit()
         except sqlite3.Error:
             return None
@@ -208,7 +206,7 @@ def get_cached_metadata(conn, path):
         row = conn.execute(
             """
             SELECT metadata_json, ckpt_name, sampler_name1, sampler_name2
-            FROM metadata_cache
+            FROM file_cache
             WHERE path = ?
             """,
             (path,),
@@ -218,6 +216,13 @@ def get_cached_metadata(conn, path):
     if row is None:
         return None
     metadata_json, ckpt_name, sampler1, sampler2 = row
+    if (
+        metadata_json is None
+        and ckpt_name is None
+        and sampler1 is None
+        and sampler2 is None
+    ):
+        return None
     samplers = [value for value in (sampler1, sampler2) if value]
     return {
         "metadata_json": metadata_json,
@@ -230,10 +235,25 @@ def update_cache(conn, date, number, path):
     if conn is None or not path:
         return
     try:
-        conn.execute(
-            "INSERT OR REPLACE INTO file_cache (date, number, path) VALUES (?, ?, ?)",
-            (date, number, path),
-        )
+        row = conn.execute(
+            "SELECT path FROM file_cache WHERE date = ? AND number = ?",
+            (date, number),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO file_cache (date, number, path) VALUES (?, ?, ?)",
+                (date, number, path),
+            )
+        elif row[0] != path:
+            conn.execute(
+                """
+                UPDATE file_cache
+                SET path = ?, metadata_json = NULL, ckpt_name = NULL,
+                    sampler_name1 = NULL, sampler_name2 = NULL
+                WHERE date = ? AND number = ?
+                """,
+                (path, date, number),
+            )
         conn.commit()
     except sqlite3.Error:
         return
@@ -247,11 +267,11 @@ def update_metadata_cache(conn, path, metadata_json, ckpt_name, sampler_names):
     try:
         conn.execute(
             """
-            INSERT OR REPLACE INTO metadata_cache
-            (path, metadata_json, ckpt_name, sampler_name1, sampler_name2)
-            VALUES (?, ?, ?, ?, ?)
+            UPDATE file_cache
+            SET metadata_json = ?, ckpt_name = ?, sampler_name1 = ?, sampler_name2 = ?
+            WHERE path = ?
             """,
-            (path, metadata_json, ckpt_name, sampler1, sampler2),
+            (metadata_json, ckpt_name, sampler1, sampler2, path),
         )
         conn.commit()
     except sqlite3.Error:
@@ -449,10 +469,11 @@ class ImageView(QtWidgets.QGraphicsView):
     def set_pixmap(self, pixmap):
         self._pixmap_item.setPixmap(pixmap)
         self.scene().setSceneRect(QtCore.QRectF(pixmap.rect()))
-        self.set_zoom(1.0)
+        self._zoom = 1.0
+        self.resetTransform()
 
     def set_zoom(self, value):
-        self._zoom = max(0.2, min(8.0, value))
+        self._zoom = max(ZOOM_MIN, min(ZOOM_MAX, value))
         self.resetTransform()
         self.scale(self._zoom, self._zoom)
 
@@ -466,10 +487,32 @@ class ImageView(QtWidgets.QGraphicsView):
             return
         factor = 1.25 if delta > 0 else 0.8
         new_zoom = self._zoom * factor
-        if 0.2 <= new_zoom <= 8.0:
+        if ZOOM_MIN <= new_zoom <= ZOOM_MAX:
             self._zoom = new_zoom
             self.scale(factor, factor)
         event.accept()
+
+    def fit_to_view(self):
+        pixmap = self._pixmap_item.pixmap()
+        if pixmap.isNull():
+            return
+        view_rect = self.viewport().rect()
+        pixmap_rect = self._pixmap_item.boundingRect()
+        if (
+            view_rect.width() <= 0
+            or view_rect.height() <= 0
+            or pixmap_rect.width() <= 0
+            or pixmap_rect.height() <= 0
+        ):
+            return
+        scale = min(
+            view_rect.width() / pixmap_rect.width(),
+            view_rect.height() / pixmap_rect.height(),
+            1.0,
+        )
+        self._zoom = scale
+        self.resetTransform()
+        self.scale(scale, scale)
 
 
 class ImageDialog(QtWidgets.QDialog):
@@ -561,6 +604,7 @@ class ImageDialog(QtWidgets.QDialog):
             self.image_view.set_pixmap(QtGui.QPixmap())
             return
         self.image_view.set_pixmap(self.original_pixmap)
+        QtCore.QTimer.singleShot(0, self.image_view.fit_to_view)
 
     def load_metadata(self):
         if not self.path or not os.path.exists(self.path):
