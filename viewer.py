@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import sys
 
 from PyQt6 import QtCore, QtGui, QtWidgets
@@ -136,7 +137,66 @@ def parse_fav_yaml(path):
     return sections
 
 
-def find_file_for_number(base_dir, date, number):
+def open_cache(base_dir):
+    path = os.path.join(base_dir, "cache.sqlite")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_cache (
+            date TEXT NOT NULL,
+            number TEXT NOT NULL,
+            path TEXT NOT NULL,
+            PRIMARY KEY (date, number)
+        )
+        """
+    )
+    return conn
+
+
+def get_cached_path(conn, date, number):
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT path FROM file_cache WHERE date = ? AND number = ?",
+            (date, number),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    path = row[0]
+    if path and os.path.exists(path):
+        return path
+    if path:
+        try:
+            conn.execute(
+                "DELETE FROM file_cache WHERE date = ? AND number = ?",
+                (date, number),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            return None
+    return None
+
+
+def update_cache(conn, date, number, path):
+    if conn is None or not path:
+        return
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO file_cache (date, number, path) VALUES (?, ?, ?)",
+            (date, number, path),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        return
+
+
+def find_file_for_number(base_dir, date, number, cache_conn=None):
+    cached = get_cached_path(cache_conn, date, number)
+    if cached:
+        return cached
     folder = os.path.join(base_dir, date)
     if not os.path.isdir(folder):
         return None
@@ -147,10 +207,14 @@ def find_file_for_number(base_dir, date, number):
     files = [name for name in entries if os.path.isfile(os.path.join(folder, name))]
     for name in files:
         if number in name and is_image_file(name):
-            return os.path.join(folder, name)
+            path = os.path.join(folder, name)
+            update_cache(cache_conn, date, number, path)
+            return path
     for name in files:
         if number in name:
-            return os.path.join(folder, name)
+            path = os.path.join(folder, name)
+            update_cache(cache_conn, date, number, path)
+            return path
     return None
 
 
@@ -400,6 +464,7 @@ class FavoritesViewer(QtWidgets.QMainWindow):
     def __init__(self, base_dir):
         super().__init__()
         self.base_dir = base_dir
+        self.cache_conn = open_cache(base_dir)
         self.setWindowTitle("ComfyUI Favorites Viewer")
         self.resize(1200, 800)
 
@@ -445,6 +510,11 @@ class FavoritesViewer(QtWidgets.QMainWindow):
             if widget is not None:
                 widget.deleteLater()
 
+    def closeEvent(self, event):
+        if self.cache_conn:
+            self.cache_conn.close()
+        super().closeEvent(event)
+
     def load_sections(self):
         self.status.setText("Loading favorites...")
         self.clear_sections()
@@ -486,7 +556,9 @@ class FavoritesViewer(QtWidgets.QMainWindow):
             container_layout.addLayout(grid)
 
             for index, number in enumerate(numbers):
-                path = find_file_for_number(self.base_dir, date, number)
+                path = find_file_for_number(
+                    self.base_dir, date, number, self.cache_conn
+                )
                 card = ImageCard(date, number, path)
                 row = index // columns
                 col = index % columns
