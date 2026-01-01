@@ -501,7 +501,7 @@ class FavoritesViewer(QtWidgets.QMainWindow):
         self.scroll_layout.addStretch()
         self.scroll.setWidget(self.scroll_widget)
 
-        self.load_sections()
+        QtCore.QTimer.singleShot(0, self.load_sections)
 
     def clear_sections(self):
         while self.scroll_layout.count() > 1:
@@ -606,7 +606,7 @@ def main():
     )
     base_dir = os.path.abspath(os.path.dirname(__file__))
     viewer = FavoritesViewer(base_dir)
-    viewer.show()
+    viewer.showMaximized()
     sys.exit(app.exec())
 
 
